@@ -1,0 +1,259 @@
+
+name: Maven-poc
+on: 
+ pull_request:
+    branches:
+      - master
+    types:
+      - closed
+ push: 
+   branches:
+      - feature
+      - master
+     
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  Job-Starting-Notification:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Send Notification to Teams
+      env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      run: |
+                  MESSAGE="Your workflow has started!"
+                  curl -X POST -H "Content-Type: application/json" -d '{
+                    "text": "'"${MESSAGE}"'"
+                  }' "${TEAMS_WEBHOOK_URL}"
+  pre-push_hook:
+    needs: Job-Starting-Notification
+    runs-on: ubuntu-latest    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Set Artifact Version
+      run: |
+        # Extract the version from pom.xml
+        version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+        echo "version=$version" >> $GITHUB_ENV
+
+    - name: Install Talisman
+      run: |
+          wget https://github.com/thoughtworks/talisman/releases/latest/download/talisman_linux_amd64 -O talisman
+          chmod +x talisman
+          sudo mv talisman /usr/local/bin/
+
+    - name: Run Talisman Check
+      run: talisman --scan 
+      continue-on-error: true
+
+    - name: Upload Report
+      uses: actions/upload-artifact@v3
+      with:
+          name: talisman-scan-report-${{ env.version }}
+          path: talisman_report/talisman_reports/data
+
+  Build_and_test:
+    needs: pre-push_hook
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+         token: ${{secrets.PAT_TOKEN }}
+            
+    - name: Build Maven
+      run: mvn -B package --file pom.xml
+      
+    - name: Sonarcloud-code coverage
+      env:
+         # GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          
+      run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.projectKey=poc-maven_maven
+    - name: Check SonarCloud Quality Gate Status
+      run: |
+        sonar_project_key='poc-maven_maven'
+        sonar_quality_gate_status=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+        "https://sonarcloud.io/api/qualitygates/project_status?projectKey=${sonar_project_key}")
+          pass_percentage_threshold=100  # Define your desired threshold here
+
+        if [[ $(echo "$sonar_quality_gate_status" | jq -r '.projectStatus.status') == "OK" ]]; then
+        echo "Quality Gate Status: passed"
+        else
+          echo "Quality Gate Status: failed"
+          exit 1
+        fi
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    - name: Unit Test
+      run: mvn --batch-mode -Dmaven.test.failure.ignore=false test
+      
+    - name: Build Test Maven
+      run: mvn -B package --file pom.xml -DskipTests   
+      
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:  
+        token: ${{secrets.PAT_TOKEN }}
+
+    - name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'adopt'
+        
+    - name: Set Artifact Name with Version
+      run: |
+              # Extract the version from pom.xml
+              version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          
+              # Create a directory with the version number
+              mkdir -p "staging/$version"
+          
+              # Copy the JAR file to the versioned directory
+              cp target/*jar-with-dependencies.jar "staging/$version"
+          
+              # Set the version as an environment variable
+              echo "version=$version" >> $GITHUB_ENV
+          
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+          name: artifact-${{ env.version }}
+          path: staging
+    #- uses: actions/upload-artifact@v3
+     # with:
+           # name: Package
+            #path: staging
+    #- name: Nexus Repo Publish
+     # uses: sonatype-nexus-community/nexus-repo-github-action@master
+      #with:
+       # serverUrl: https://annually-quality-seagull.ngrok-free.app
+        #username: admin
+        #password: ${{ secrets.password }}
+        #format: maven2
+        #repository: maven-GH
+        #coordinates: groupId=com.example artifactId=app version=1.0.0
+        #assets: extension=jar
+        #filename: target/*jar-with-dependencies.jar
+    
+   
+    - name: Generate SBOM
+      run: mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom         
+     
+    - name: Upload SBOM report to artifact
+      uses: actions/upload-artifact@v3
+      with:
+          name: sbom-${{ env.version }}
+          path: target/bom.xml
+
+    - name: Check Commit Message
+      id: commit-message
+      run: |
+              if [[ "$(git log -1 --pretty=%B)" == *"[skip ci]"* ]]; then
+                echo "Commit message indicates skipping workflow."
+                echo "::set-output name=skip::true"
+              fi
+      continue-on-error: true
+
+    - name: Update Pom.xml Version
+      if: steps.commit-message.outputs.skip != 'true'
+      run: |
+            # Increment the version number, e.g., using Semantic Versioning
+            # Replace this with your versioning logic
+            current_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+            
+            # Use echo and pipe to split the version string
+            IFS='.' read -ra version_parts <<< "$current_version"
+            major="${version_parts[0]}"
+            minor="${version_parts[1]}"
+            patch="${version_parts[2]}"
+            
+            # Increment the patch version
+            new_patch=$((patch + 1))
+            
+            # Construct the new version string
+            new_version="$major.$minor.$new_patch"
+            
+            # Use the Maven Versions Plugin to update the version in the pom.xml
+            mvn versions:set -DnewVersion="$new_version"
+            
+            # Commit the updated pom.xml locally
+            git config --global user.email "preethiagnest@gmail.com"
+            git config --global user.name "PreethiAgnes"
+            git commit -am "[skip ci]"
+
+    - name: Push Changes to Repository
+      if: steps.commit-message.outputs.skip != 'true'
+      run: |
+                # Push the changes to the repository
+                git push origin
+      env:
+                  PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+    
+   
+  Docker_push:
+    needs: Build_and_test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+    - name: Build Container image
+      run: docker build -t ${{ secrets.DOCKER_REPO }}:${{ github.sha }} .
+    - name: Publish Docker image
+      run: docker push ${{ secrets.DOCKER_REPO }}:${{ github.sha }}
+  Deploy:
+    needs: Docker_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          repository: Hamritha02/Deployment   # Replace with the repository URL
+          ref: main 
+          token: ${{secrets.PAT_TOKEN }}
+   
+      - name: Modify Manifest
+        run: |
+            # Replace the image and tag in the manifest file
+             echo "GitHub SHA: ${{ github.sha }}"
+             sed -i "s|hamritha817/github-action-maven-tutorial:.*|hamritha817/github-action-maven-tutorial:${{ github.sha }}|" ./manifest/deployment.yaml
+
+      - name: Debug - Show Git Status After Changes
+        run: git status
+        shell: bash
+ 
+
+      - name: Commit and Push Change
+        run: |
+            git config --global user.name "Hamritha02"
+            git config --global user.email "hamrithaanand02@gmail.com"
+            git add ./manifest/deployment.yaml
+            git commit -m "Update image tag with github.sha"
+            git push origin main  
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+  Job-Ending-Notification:
+    needs: Deploy
+    runs-on: ubuntu-latest
+    steps:
+    - name: Send Notification to Teams
+      env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      run: |
+                  MESSAGE="Your workflow has completed successfully!"
+                  curl -X POST -H "Content-Type: application/json" -d '{
+                    "text": "'"${MESSAGE}"'"
+                  }' "${TEAMS_WEBHOOK_URL}"
+     
