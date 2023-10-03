@@ -17,7 +17,7 @@ jobs:
   Job-Starting-Notification:
     runs-on: ubuntu-latest
     steps:
-    - name: Send Notification to Teams
+    - name: Send Notification to Team
       env:
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
       run: |
